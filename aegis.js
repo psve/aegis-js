@@ -231,9 +231,9 @@ var aegis128L = (function(){
     const x = new Uint8Array(msgArray.buffer);
     msg.set(x.slice(0, msgLen));
 
-    // Generate tag
-    const tag64 = new BigUint64Array([BigInt(dataLen)*8n, BigInt(msgLen)*8n]);
-    let tag = new Uint32Array(tag64.buffer);
+    // Generate tag. Note that the encoding here restricts data and message length to
+    // 2^32 instead of 2^64 as per the specification.
+    let tag = new Uint32Array([dataLen*8, 0, msgLen*8, 0]);
     xor128into(s32[2], tag, 0);
     for (let i = 0 ; i < 7 ; i++) {
       update(tag, 0, tag, 0);
