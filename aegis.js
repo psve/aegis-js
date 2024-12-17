@@ -35,12 +35,10 @@ var aegis128L = (function(){
 
   const keyBytes = 16;
   const nonceBytes = 16;
-  const tagBytes = 16;
   const const0 = new Uint32Array([0x02010100, 0xd080503, 0x59372215, 0x6279e990]);
   const const1 = new Uint32Array([0x55183ddb, 0xf12fc26d, 0x42311120, 0xdd28b573]);
-  let t = [[],[],[],[]];
-  let s32 = undefined;
-  let s8 = undefined;
+  const t = [[],[],[],[]];
+  const temp = new Uint8Array(16);
 
   function init() {
     if (!t[0][0]) {
@@ -98,14 +96,21 @@ var aegis128L = (function(){
     return equal;
   }
 
-  function zeroPad(data, withTag) {
+  function lastBlock(data) {
     if (data.byteLength%32 != 0) {
-      let padLen = 32 - data.byteLength%32;
-      let padded = new Uint8Array(data.byteLength + padLen);
-      padded.set(data);
-      return new Uint32Array(padded.buffer);
+      const last = new Uint8Array(32);
+      last.set(data.subarray(data.byteLength - data.byteLength%32));
+      return new Uint32Array(last.buffer);
     }
-    return new Uint32Array(data.buffer);
+    return undefined;
+  }
+
+  function U32ArrayFromU8Array(a, bytes) {
+    // If data is aligned, we can avoid a copy.
+    if (a.byteOffset % 4 == 0) {
+      return new Uint32Array(a.buffer, a.byteOffset, bytes/4);
+    }
+    return new Uint32Array(a.slice(0, bytes).buffer, 0, bytes/4);
   }
 
   function extract(a, b, c, d) {
@@ -124,8 +129,8 @@ var aegis128L = (function(){
     dst[dstOffset + 3] ^= val[3];
   }
 
-  function update(a, aOffset, b, bOffset) {
-    let t = s8[7].slice();
+  function update(s32, s8, a, aOffset, b, bOffset) {
+    temp.set(s8[7]);
 
     round(s8[6], s32[7], s32[7]);
     round(s8[5], s32[6], s32[6]);
@@ -146,7 +151,7 @@ var aegis128L = (function(){
     s32[0][2] ^= a[aOffset+2];
     s32[0][3] ^= a[aOffset+3];
 
-    round(t, s32[0], s32[0]);
+    round(temp, s32[0], s32[0]);
   }
 
   // Inputs are all Uint8Array.
@@ -163,13 +168,19 @@ var aegis128L = (function(){
     const msgLen = msg.byteLength;
     const dataLen = data.byteLength;
 
-    const keyArray = new Uint32Array(key.buffer);
-    const nonceArray = new Uint32Array(nonce.buffer);
-    const msgArray = zeroPad(msg);
-    const dataArray = zeroPad(data);
+    const keyArray = U32ArrayFromU8Array(key, keyBytes);
+    const nonceArray = U32ArrayFromU8Array(nonce, nonceBytes);
+
+    const fullMsgBlocks = (msg.byteLength - msg.byteLength%32)/32;
+    const msgBlocks = U32ArrayFromU8Array(msg, fullMsgBlocks*32);
+    const lastMsgBlock = lastBlock(msg);
+
+    const fullDataBlocks = (data.byteLength - data.byteLength%32)/32;
+    const dataBlocks = U32ArrayFromU8Array(data, fullDataBlocks*32);
+    const lastDataBlock = lastBlock(data);
 
     // Initialize
-    s32 = [
+    const s32 = [
       new Uint32Array(keyArray),
       new Uint32Array(const1),
       new Uint32Array(const0),
@@ -179,7 +190,7 @@ var aegis128L = (function(){
       new Uint32Array(keyArray),
       new Uint32Array(keyArray),
     ];
-    s8 = [
+    const s8 = [
       new Uint8Array(s32[0].buffer),
       new Uint8Array(s32[1].buffer),
       new Uint8Array(s32[2].buffer),
@@ -197,46 +208,61 @@ var aegis128L = (function(){
     xor128into(const0, s32[7], 0);
 
     for (let i = 0 ; i < 10 ; i++) {
-      update(nonceArray, 0, keyArray, 0)
+      update(s32, s8, nonceArray, 0, keyArray, 0)
     }
 
     // Process associated data
-    const dataBlocks = dataArray.byteLength/32;
-    for (let i = 0 ; i < dataBlocks ; i++) {
-      update(dataArray, i*8, dataArray, i*8+4)
+    for (let i = 0 ; i < fullDataBlocks ; i++) {
+      update(s32, s8, dataBlocks, i*8, dataBlocks, i*8+4)
+    }
+    if (lastDataBlock != undefined) {
+      update(s32, s8, lastDataBlock, 0, lastDataBlock, 4)
     }
 
     // Process plaintext
-    const msgBlocks = msgArray.byteLength/32;
-    for (let i = 0 ; i < msgBlocks ; i++) {
+    for (let i = 0 ; i < fullMsgBlocks ; i++) {
       const z0 = extract(s32[2], s32[3], s32[1], s32[6]);
       const z1 = extract(s32[6], s32[7], s32[5], s32[2]);
 
       if (!decrypt) {
-        update(msgArray, i*8, msgArray, i*8+4);
+        update(s32, s8, msgBlocks, i*8, msgBlocks, i*8+4);
       }
 
-      xor128into(z0, msgArray, i*8);
-      xor128into(z1, msgArray, i*8+4);
+      xor128into(z0, msgBlocks, i*8);
+      xor128into(z1, msgBlocks, i*8+4);
 
       if (decrypt) {
-        // Recreate zero padding if needed
-        if (msgLen < (i+1)*32) {
-          let x = new Uint8Array(msgArray.buffer);
-          x.fill(0, msgLen);
-        }
-        update(msgArray, i*8, msgArray, i*8+4);
+        update(s32, s8, msgBlocks, i*8, msgBlocks, i*8+4);
       }
     }
-    const x = new Uint8Array(msgArray.buffer);
-    msg.set(x.slice(0, msgLen));
+
+    if (lastMsgBlock != undefined) {
+      const z0 = extract(s32[2], s32[3], s32[1], s32[6]);
+      const z1 = extract(s32[6], s32[7], s32[5], s32[2]);
+
+      if (!decrypt) {
+        update(s32, s8, lastMsgBlock, 0, lastMsgBlock, 4);
+      }
+
+      xor128into(z0, lastMsgBlock, 0);
+      xor128into(z1, lastMsgBlock, 4);
+
+      if (decrypt) {
+        const x = new Uint8Array(lastMsgBlock.buffer);
+        x.fill(0, msg.byteLength%32);
+        update(s32, s8, lastMsgBlock, 0, lastMsgBlock, 4);
+      }
+
+      const x = new Uint8Array(lastMsgBlock.buffer, 0, msgLen - msgBlocks.byteLength);
+      msg.set(x, msgBlocks.byteLength);
+    }
 
     // Generate tag. Note that the encoding here restricts data and message length to
     // 2^32 instead of 2^64 as per the specification.
     let tag = new Uint32Array([dataLen*8, 0, msgLen*8, 0]);
     xor128into(s32[2], tag, 0);
     for (let i = 0 ; i < 7 ; i++) {
-      update(tag, 0, tag, 0);
+      update(s32, s8, tag, 0, tag, 0);
     }
     tag = s32[0];
     xor128into(s32[1], tag, 0);
@@ -258,7 +284,9 @@ var aegis128L = (function(){
 
   function open(key, nonce, msg, data, tag) {
     const tagDecrypt = process(key, nonce, msg, data, true);
-    if (!tagValid(tag, tagDecrypt)) {
+    const tagDecrypt_uint8 = new Uint8Array(tagDecrypt);
+    const tagEncrypt_uint8 = new Uint8Array(tag);
+    if (!tagValid(tagEncrypt_uint8, tagDecrypt_uint8)) {
       msg.fill(0);
       return false;
     }
@@ -300,7 +328,9 @@ var aegis128L = (function(){
     let msg = plaintext.slice();
 
     let tagEncrypt = seal(key, nonce, msg, data);
-    tagEncrypt[0] ^= 1;
+
+    let tag_uint8 = new Uint8Array(tagEncrypt);
+    tag_uint8[0] ^= 1;
 
     let valid = open(key, nonce, msg, data, tagEncrypt);
     if (valid) {
